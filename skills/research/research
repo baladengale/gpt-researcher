@@ -1,0 +1,671 @@
+#!/usr/bin/env bash
+# research — ZCode/Claude skill runner for headless gpt-researcher (local repo
+# checkout). Renamed from `gptr` per BALA directive 2026-11-07: research-first
+# CLI, the first argument is the query.
+#
+# Contract: subcommands that run research emit EXACTLY ONE JSON line on stdout;
+# every other diagnostic goes to stderr. `list` emits one JSON ARRAY line;
+# `resolve` emits one JSON line. `serve` and `help` print human text.
+#
+# Discovery (2026-11-07): `list` / `resolve <sel>` / `view [sel]` are read-only
+# report discovery+viewing over the three on-disk report locations (no lock, no
+# API calls). Selector <sel> = list index (3), file path, directory (newest .md
+# inside), or case-insensitive title/filename substring (must be unique).
+# `view` renders to styled HTML and opens the browser (--term: glow in the
+# terminal instead, human mode, no JSON).
+#
+# Verbose (BALA directive 2026-11-07): child output (cli.py / deep_agents /
+# multi_agents) streams LIVE to stderr by default and is tee'd to $RUN_LOG;
+# --quiet logs only. After a successful run the report body (frontmatter
+# stripped) is glow-rendered to stderr; --no-preview skips it. stdout contract
+# is unchanged — exactly one JSON line.
+#
+# Verified override mechanisms (static read, R2 2026-11-07; repo root below):
+#
+#   research: cli.py takes query (cli.py:40-44), --report_type choices from
+#     ReportType enum (cli.py:62-70; gpt_researcher/utils/enum.py:21-27),
+#     --tone objective default (cli.py:76-84), --query_domains comma list
+#     (cli.py:101-106), --report_source (cli.py:112-119), --no-pdf/--no-docx
+#     (cli.py:125-135). Writes outputs/<llm-title>.md with YAML frontmatter
+#     task_id/title/sources_count/total_cost_usd (cli.py:209-245) and prints
+#     "Report written to '<path>'" (cli.py:336).
+#
+#   serve: run_api.sh sources .env, sets PYTHONPATH=<repo>:<repo>/backend,
+#     execs .venv/bin/python backend/run_server.py (run_api.sh:4-7); uvicorn
+#     binds 0.0.0.0:8000 (backend/run_server.py:21-27). POST /report/ with
+#     generate_in_background:false awaits and returns
+#     {report, docx_path, pdf_path, research_information{source_urls,
+#     research_costs, visited_urls, research_images}}
+#     (backend/server/app.py:371-381, 352-365).
+#
+#   deep: deep_agents/main.py has NO CLI args — query is read from
+#     deep_agents/task.json (open_task deep_agents/main.py:18-30; main()
+#     deep_agents/main.py:94-96 passes task["query"]). The runner therefore
+#     writes the query into task.json, preserving all other fields.
+#     Model: deep_agents/agent.py:64 —
+#         model = os.environ.get("STRATEGIC_LLM") or task.get("model", "openai:gpt-5.4")
+#     i.e. env STRATEGIC_LLM (full "provider:model" string) BEATS task.json
+#     model; .env already sets STRATEGIC_LLM=openai:glm-5.3-flash and
+#     deep_agents/main.py:10 load_dotenv() picks it up. Belt-and-braces: the
+#     runner ALSO forces task.json model to "openai:glm-5.3-flash" (shipped
+#     value "openai:gpt-5.4" is rejected by the Z.AI endpoint). Report lands
+#     in deep_agents/outputs/run_<8hex>/report.md (deep_agents/main.py:68-88;
+#     prints "Report written to <path>" at :86).
+#
+#   multi: multi_agents/main.py:59-65 — STRATEGIC_LLM env overrides
+#     task.json model, stripping the provider prefix
+#     ("openai:glm-5.3-flash" -> task["model"]="glm-5.3-flash"). Consumers
+#     pass the bare name to call_model (editor.py:47, writer.py:68,93,
+#     reviewer.py:47, fact_checker.py:31, visualizer.py:27, reviser.py:49)
+#     and the provider comes from cfg.smart_llm_provider — parsed from
+#     SMART_LLM=openai:glm-5.3-flash (multi_agents/agents/utils/llms.py:20-27;
+#     gpt_researcher/config/config.py:86-87). Query has no CLI arg either:
+#     main() reads task.json (multi_agents/main.py:81-87), so the runner
+#     writes query + include_human_feedback:false + publish_formats
+#     markdown-only into multi_agents/task.json (shipped fields per
+#     multi_agents/task.json:1-19). Human gate is inert with
+#     include_human_feedback false (human.py:18-45 -> plan_review.py:8-10
+#     returns "accept"). Output dir = ./outputs/run_<unixtime>_<query[:40]>
+#     (orchestrator.py:42-49); md file = <uuid>.md inside it
+#     (agents/utils/file_formats.py:24-36, prints "Report written to <path>").
+#
+# No repo code changes required: all four subcommands are headless as shipped.
+
+set -u
+
+REPO="/Users/bala/workspace/gpt-researcher"
+GPTR_HOME="${GPTR_HOME:-$REPO}"
+LOCK_DIR="/tmp/gptr.lock"
+LOCK_WAIT="${GPTR_LOCK_WAIT:-900}"   # seconds to wait for a running research job
+RUN_LOG="${TMPDIR:-/tmp}/gptr-last-run.log"
+API_PID="/tmp/gptr-api.pid"
+API_LOG="/tmp/gptr-api.log"
+API_URL="http://localhost:8000"
+GLM="openai:glm-5.3-flash"
+GLM_BARE="glm-5.3-flash"
+QUIET=0      # 1 = --quiet: no live stream, log file only
+PREVIEW=1    # 0 = --no-preview: skip the glow markdown render
+RUN_RC=0     # set by run_streamed
+GPTR_GLOW="$(command -v glow 2>/dev/null || true)"
+[ -z "$GPTR_GLOW" ] && [ -x /opt/homebrew/bin/glow ] && GPTR_GLOW=/opt/homebrew/bin/glow
+
+err()  { printf '%s\n' "$*" >&2; }
+die()  { err "research: $*"; exit 1; }
+
+json_escape() {
+  # Escape backslash and double quote; control chars are not expected in titles.
+  local s="$1"
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  printf '%s' "$s"
+}
+
+usage() {
+  cat >&2 <<'EOF'
+research — one-shot autonomous research reports (gpt-researcher, local checkout)
+
+Usage:
+  research "<query>" [--type research_report|detailed_report|resource_report|outline_report|custom_report|subtopic_report|deep]
+                     [--domains a.com,b.com] [--tone objective] [--source web]
+  research deep  "<query>"   deep_agents stack (chief editor + parallel researcher subagents)
+  research multi "<query>"   multi_agents LangGraph stack (plan -> research -> review -> publish)
+  research list               list past reports (table on stderr, JSON array on stdout)
+  research resolve <selector> print one report's path as a JSON line (no browser)
+  research view  [selector]   open a report in the browser as rendered HTML
+                              selector: list index (3), path, directory (newest .md
+                              inside), or title substring (avgo); default: newest.
+                              --term = glow-render in the terminal instead
+  research serve start|stop|status   optional FastAPI on :8000 (POST /report/ consumer)
+
+The first argument is the QUERY unless it is deep|multi|view|list|resolve|serve|help.
+Shared flags for the research paths:
+  --quiet        no live stream (child output still logged to the run log)
+  --no-preview   skip the glow markdown preview of the final report
+
+Every research path streams child output LIVE to stderr, glow-renders the
+final report to stderr, then prints ONE JSON line on stdout, e.g.
+  {"path":"/…/outputs/X.md","title":"X","sources_count":15,"total_cost_usd":0.20}
+EOF
+}
+
+require_repo() {
+  [ -d "$REPO" ] || die "repo missing: $REPO"
+  [ -f "$REPO/.env" ] || die ".env missing in $REPO (need OPENAI_API_KEY/OPENAI_BASE_URL, RETRIEVER)"
+  [ -x "$REPO/.venv/bin/python" ] || die ".venv missing in $REPO"
+}
+
+load_env() {
+  set -a
+  # shellcheck disable=SC1091
+  . "$REPO/.env"
+  set +a
+}
+
+acquire_lock() {
+  local waited=0
+  until mkdir "$LOCK_DIR" 2>/dev/null; do
+    [ "$waited" -ge "$LOCK_WAIT" ] && die "lock busy: $LOCK_DIR held (another research run in progress?)"
+    sleep 5
+    waited=$((waited + 5))
+  done
+  trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+}
+
+# newest_report <dir> <pattern> <marker> — newest file matching pattern newer than marker
+newest_after() {
+  local dir="$1" pattern="$2" marker="$3"
+  find "$dir" -maxdepth 3 -path "$pattern" -type f -newer "$marker" 2>/dev/null | while IFS= read -r f; do
+    printf '%s\n' "$f"
+  done | while IFS= read -r f; do printf '%s\t%s\n' "$(stat -f %m "$f")" "$f"; done \
+    | sort -rn | head -1 | cut -f2-
+}
+
+resolve_path() {
+  case "$1" in
+    /*) printf '%s' "$1" ;;
+    *)  printf '%s/%s' "$REPO" "$1" ;;
+  esac
+}
+
+# parse_fm <file> <key> — value from YAML frontmatter (unquoted)
+parse_fm() {
+  sed -n '2,/^---[[:space:]]*$/p' "$1" | sed -e '/^---/d' \
+    | sed -n "s/^$2:[[:space:]]*//p" | head -1 | sed -e 's/^"//' -e 's/"$//'
+}
+
+emit_report_json() {
+  # $1 = absolute md path
+  local f="$1" title sc cost
+  [ -f "$f" ] || die "report file not found: $f"
+  head -1 "$f" | grep -q '^---' || die "no YAML frontmatter in $f (not a cli.py output?)"
+  title=$(parse_fm "$f" title)
+  sc=$(parse_fm "$f" sources_count)
+  cost=$(parse_fm "$f" total_cost_usd)
+  printf '{"path":"%s","title":"%s","sources_count":%s,"total_cost_usd":%s}\n' \
+    "$(json_escape "$f")" "$(json_escape "$title")" "${sc:-0}" "${cost:-0}"
+}
+
+# run_streamed <logfile> <cmd...> — run <cmd>, streaming its combined output
+# live to stderr (and <logfile>) by default, or to <logfile> only under
+# --quiet. Sets RUN_RC to the command's exit status.
+run_streamed() {
+  local logfile="$1"; shift
+  if [ "$QUIET" = "1" ]; then
+    "$@" >"$logfile" 2>&1
+    RUN_RC=$?
+  else
+    "$@" 2>&1 | tee "$logfile" >&2
+    RUN_RC=${PIPESTATUS[0]}
+  fi
+}
+
+# preview_report <md-file> — glow-render the report body (frontmatter stripped)
+# to stderr, honoring --no-preview. Renders the whole file when there is no
+# frontmatter; skips with a note when glow is missing.
+preview_report() {
+  local f="$1" end
+  [ "$PREVIEW" = "1" ] || return 0
+  [ -f "$f" ] || return 0
+  if [ -z "$GPTR_GLOW" ]; then
+    err "research: glow not found — skipping preview (brew install glow)"
+    return 0
+  fi
+  # glow width flag as a SCALAR, not an array: macOS /bin/bash 3.2 under
+  # set -u (line 66) treats an empty-array expansion "${wargs[@]}" as an
+  # unbound variable and kills the run before the JSON line is emitted
+  # (observed live on the Singapore multi run 2026-11-07). $wopt unquoted is
+  # safe: it is either empty or the controlled "-w 100".
+  local wopt=""
+  [ -t 2 ] || wopt="-w 100"
+  end=$(awk 'NR>1 && /^---[[:space:]]*$/{print NR; exit}' "$f")
+  err "research: ---- report preview (glow) ----"
+  if [ -n "$end" ]; then
+    tail -n +"$((end + 1))" "$f" | "$GPTR_GLOW" $wopt - >&2
+  else
+    "$GPTR_GLOW" $wopt "$f" >&2
+  fi
+  err "research: ---- end preview ----"
+}
+
+cmd_research() {
+  local query="$1"; shift
+  local rtype="research_report" domains="" tone="objective" source="web"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --type)    rtype="$2"; shift 2 ;;
+      --domains) domains="$2"; shift 2 ;;
+      --tone)    tone="$2"; shift 2 ;;
+      --source)  source="$2"; shift 2 ;;
+      --quiet)      QUIET=1 ;;
+      --no-preview) PREVIEW=0 ;;
+      *) die "unknown research flag: $1" ;;
+    esac
+  done
+  case "$rtype" in
+    research_report|detailed_report|resource_report|outline_report|custom_report|subtopic_report|deep) ;;
+    *) die "invalid --type '$rtype' (enum.py:21-27)" ;;
+  esac
+  [ -n "$query" ] || die "empty query"
+
+  require_repo; load_env; acquire_lock
+  local marker; marker=$(mktemp "${TMPDIR:-/tmp}/gptr-marker.XXXXXX")
+
+  err "research: running cli.py ($rtype) — ~2 min for research_report, ~5 min for detailed_report"
+  _run() {
+    (
+      cd "$GPTR_HOME" || exit 1
+      args=( --report_type "$rtype" --tone "$tone" --report_source "$source" --no-pdf --no-docx )
+      [ -n "$domains" ] && args+=( --query_domains "$domains" )
+      exec "$REPO/.venv/bin/python" -u cli.py "$query" "${args[@]}"
+    )
+  }
+  run_streamed "$RUN_LOG" _run
+  local rc=$RUN_RC
+
+  local out=""
+  if [ $rc -eq 0 ]; then
+    out=$(sed -n "s/^Report written to '\(.*\)'$/\1/p" "$RUN_LOG" | tail -1)
+    [ -n "$out" ] || out=$(newest_after "$GPTR_HOME/outputs" "*.md" "$marker")
+  fi
+  rm -f "$marker"
+  [ $rc -eq 0 ] || { err "research: cli.py failed (rc=$rc); log tail:"; tail -20 "$RUN_LOG" >&2; exit $rc; }
+  [ -n "$out" ] || die "no report path found (log: $RUN_LOG)"
+  local abs; abs=$(resolve_path "$out")
+  preview_report "$abs"
+  emit_report_json "$abs"
+}
+
+cmd_deep() {
+  local query="$1"; shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --quiet)      QUIET=1; shift ;;
+      --no-preview) PREVIEW=0; shift ;;
+      *) die "unknown deep flag: $1" ;;
+    esac
+  done
+  [ -n "$query" ] || die "empty query"
+  require_repo; load_env; acquire_lock
+  local marker; marker=$(mktemp "${TMPDIR:-/tmp}/gptr-marker.XXXXXX")
+
+  # Write query into deep_agents/task.json, force model, preserve other fields.
+  # (deep_agents/main.py has no CLI args; model per agent.py:64 prefers env
+  # STRATEGIC_LLM, task.json edit is the mandated fallback.)
+  GPTR_Q="$query" GPTR_M="$GLM" "$REPO/.venv/bin/python" - <<'PY'
+import json, os
+p = "/Users/bala/workspace/gpt-researcher/deep_agents/task.json"
+with open(p) as f:
+    t = json.load(f)
+t["query"] = os.environ["GPTR_Q"]
+t["model"] = os.environ["GPTR_M"]
+with open(p, "w") as f:
+    json.dump(t, f, indent=2)
+    f.write("\n")
+print("task.json updated:", p)
+PY
+  [ $? -eq 0 ] || die "failed to update deep_agents/task.json"
+
+  err "research: running deep_agents/main.py — expect 5-15 min, parallel subagents"
+  _run() { ( cd "$GPTR_HOME" || exit 1; exec "$REPO/.venv/bin/python" -u deep_agents/main.py ); }
+  run_streamed "$RUN_LOG" _run
+  local rc=$RUN_RC
+
+  local out=""
+  if [ $rc -eq 0 ]; then
+    out=$(sed -n 's/^Report written to \(.*\)$/\1/p' "$RUN_LOG" | tail -1)
+    [ -n "$out" ] || out=$(newest_after "$GPTR_HOME/deep_agents/outputs" "*/report.md" "$marker")
+  fi
+  rm -f "$marker"
+  [ $rc -eq 0 ] || { err "research: deep run failed (rc=$rc); log tail:"; tail -20 "$RUN_LOG" >&2; exit $rc; }
+  [ -n "$out" ] || die "no report.md found (log: $RUN_LOG)"
+  out=$(resolve_path "$out")
+  preview_report "$out"
+  printf '{"path":"%s","title":null,"sources_count":null,"total_cost_usd":null}\n' "$(json_escape "$out")"
+}
+
+cmd_multi() {
+  local query="$1"; shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --quiet)      QUIET=1; shift ;;
+      --no-preview) PREVIEW=0; shift ;;
+      *) die "unknown multi flag: $1" ;;
+    esac
+  done
+  [ -n "$query" ] || die "empty query"
+  require_repo; load_env
+  # Verified override: multi_agents/main.py:59-65 — STRATEGIC_LLM beats
+  # task.json model (prefix stripped). Export explicitly even though .env
+  # already carries it, so the runner is independent of .env drift.
+  export STRATEGIC_LLM="$GLM"
+  acquire_lock
+  local marker; marker=$(mktemp "${TMPDIR:-/tmp}/gptr-marker.XXXXXX")
+
+  GPTR_Q="$query" "$REPO/.venv/bin/python" - <<'PY'
+import json, os
+p = "/Users/bala/workspace/gpt-researcher/multi_agents/task.json"
+with open(p) as f:
+    t = json.load(f)
+t["query"] = os.environ["GPTR_Q"]
+t["include_human_feedback"] = False
+t["publish_formats"] = {"markdown": True, "pdf": False, "docx": False}
+t["model"] = "glm-5.3-flash"  # bare name; provider comes from cfg.smart_llm_provider
+with open(p, "w") as f:
+    json.dump(t, f, indent=2)
+    f.write("\n")
+print("task.json updated:", p)
+PY
+  [ $? -eq 0 ] || die "failed to update multi_agents/task.json"
+
+  err "research: running multi_agents/main.py — expect 5-20 min (plan -> parallel research -> review -> publish)"
+  _run() { ( cd "$GPTR_HOME" || exit 1; exec "$REPO/.venv/bin/python" -u multi_agents/main.py ); }
+  run_streamed "$RUN_LOG" _run
+  local rc=$RUN_RC
+
+  local out=""
+  if [ $rc -eq 0 ]; then
+    out=$(sed -n 's/^Report written to \(.*\.md\)$/\1/p' "$RUN_LOG" | tail -1)
+    [ -n "$out" ] || out=$(newest_after "$GPTR_HOME/outputs" "run_*/*.md" "$marker")
+  fi
+  rm -f "$marker"
+  [ $rc -eq 0 ] || { err "research: multi run failed (rc=$rc); log tail:"; tail -20 "$RUN_LOG" >&2; exit $rc; }
+  [ -n "$out" ] || die "no output md found (log: $RUN_LOG)"
+  out=$(resolve_path "$out")
+  preview_report "$out"
+  local run_dir; run_dir=$(dirname "$out")
+  printf '{"path":"%s","run_dir":"%s","title":null,"sources_count":null,"total_cost_usd":null}\n' \
+    "$(json_escape "$out")" "$(json_escape "$run_dir")"
+}
+
+# scan_reports <mode> [selector] — stdlib-python scanner shared by list /
+# resolve / view. Modes: list (human table -> stderr, ONE JSON array line ->
+# stdout, newest first), resolve <sel> (ONE JSON line for the selector),
+# path <sel> (bare resolved path, for cmd_view). Selector: list index, file
+# path, directory (newest .md inside), or case-insensitive title/filename
+# substring (must match exactly one).
+scan_reports() {
+  local mode="$1" sel="${2:-}"
+  GPTR_MODE="$mode" GPTR_SEL="$sel" "$REPO/.venv/bin/python" - <<'PY'
+import datetime, glob, json, os, re, sys
+
+REPO = "/Users/bala/workspace/gpt-researcher"
+MODE = os.environ.get("GPTR_MODE", "list")
+SEL = os.environ.get("GPTR_SEL", "")
+
+def die(msg, code=2):
+    print(f"research: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+def frontmatter(text):
+    """Key/value dict from the YAML frontmatter block; {} when absent."""
+    meta = {}
+    if not text.startswith("---"):
+        return meta
+    for line in text.splitlines()[1:]:
+        if line.strip() == "---":
+            break
+        if ":" in line:
+            k, v = line.split(":", 1)
+            meta[k.strip()] = v.strip().strip('"').strip("'")
+    return meta
+
+def scan():
+    """All reports under the three on-disk locations, newest first."""
+    pats = (
+        (os.path.join(REPO, "outputs", "*.md"), "cli"),
+        (os.path.join(REPO, "outputs", "run_*", "*.md"), "multi"),
+        (os.path.join(REPO, "deep_agents", "outputs", "run_*", "report.md"), "deep"),
+    )
+    entries, seen = [], set()
+    for pat, kind in pats:
+        for f in sorted(glob.glob(pat)):
+            if f in seen or not os.path.isfile(f):
+                continue
+            seen.add(f)
+            try:
+                with open(f, encoding="utf-8", errors="replace") as fh:
+                    meta = frontmatter(fh.read(8192))
+            except OSError:
+                continue
+            st = os.stat(f)
+            title = meta.get("title") or (
+                re.sub(r"^run_\d+_", "", os.path.basename(os.path.dirname(f)))
+                if kind == "multi" else os.path.splitext(os.path.basename(f))[0]
+            )
+            entries.append({
+                "path": f, "kind": kind, "title": title,
+                "date": datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M"),
+                "mtime": st.st_mtime, "size_bytes": st.st_size,
+                "sources_count": meta.get("sources_count") or None,
+                "total_cost_usd": meta.get("total_cost_usd") or None,
+            })
+    entries.sort(key=lambda e: -e.pop("mtime"))
+    return entries
+
+def table(entries, out=sys.stderr):
+    if not entries:
+        print("no reports yet — run: research \"<query>\"", file=out)
+        return
+    print(f"{'#':>2}  {'date':16}  {'kind':5}  {'src':>3}  {'cost':>8}  title", file=out)
+    for i, e in enumerate(entries, 1):
+        t = e["title"] if len(e["title"]) <= 58 else e["title"][:57] + "..."
+        print(f"{i:>2}  {e['date']:16}  {e['kind']:5}  {str(e['sources_count'] or '-'):>3}"
+              f"  {str(e['total_cost_usd'] or '-'):>8}  {t}", file=out)
+
+def resolve(entries):
+    """(path, entry|None) for SEL; dies with guidance when unresolvable."""
+    if not entries:
+        die('no reports yet — run: research "<query>"')
+    if not SEL:
+        return entries[0]["path"], entries[0]          # newest
+    if re.fullmatch(r"\d+", SEL):
+        n = int(SEL)
+        if not 1 <= n <= len(entries):
+            die(f"index {n} out of range 1..{len(entries)} — run: research list")
+        return entries[n - 1]["path"], entries[n - 1]
+    p = SEL if os.path.isabs(SEL) else os.path.join(REPO, SEL)
+    if os.path.isdir(p):
+        mds = sorted(glob.glob(os.path.join(p, "**", "*.md"), recursive=True),
+                     key=os.path.getmtime, reverse=True)
+        if not mds:
+            die(f"no .md under directory: {p}")
+        return mds[0], None
+    if os.path.isfile(p):
+        return p, None
+    hay = SEL.lower()
+    idxs = [(i, e) for i, e in enumerate(entries, 1)
+            if hay in e["title"].lower() or hay in os.path.basename(e["path"]).lower()]
+    if len(idxs) == 1:
+        i, e = idxs[0]
+        return e["path"], e
+    if not idxs:
+        die(f"no report matching '{SEL}' — run: research list")
+    die(f"'{SEL}' is ambiguous ({len(idxs)} matches): "
+        + "; ".join(f"#{i} {e['title'][:34]}" for i, e in idxs))
+
+if MODE == "list":
+    es = scan()
+    table(es)
+    print(json.dumps(es))
+elif MODE == "resolve":
+    path, e = resolve(scan())
+    if e is None:
+        print(json.dumps({"path": path}))
+    else:
+        print(json.dumps({"path": path, "title": e["title"], "kind": e["kind"],
+                          "sources_count": e["sources_count"],
+                          "total_cost_usd": e["total_cost_usd"]}))
+elif MODE == "path":
+    path, _ = resolve(scan())
+    print(path)
+else:
+    die(f"scan_reports: unknown mode {MODE}")
+PY
+}
+
+# cmd_list — human table on stderr, ONE JSON array line on stdout. Read-only.
+cmd_list() {
+  require_repo
+  scan_reports list
+}
+
+# cmd_resolve <selector> — print the resolved report path as one JSON line,
+# without opening anything. Lets a consumer map "view #2" / "view avgo" to a
+# path first. Read-only.
+cmd_resolve() {
+  [ -n "${1:-}" ] || die "resolve: pass an index, path, directory, or title substring"
+  require_repo
+  scan_reports resolve "$1"
+}
+
+# cmd_view [selector] [--term] — resolve the selector (default: newest), then
+# glow-render the report to the terminal (--term, human mode, no JSON) or
+# render it to styled HTML with the repo venv's markdown lib and open it in
+# the default browser. Read-only: no API calls, no lock, no .env needed.
+cmd_view() {
+  local sel="" term=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --term) term=1; shift ;;
+      *) [ -z "$sel" ] || die "view: unexpected extra argument: $1"
+         sel="$1"; shift ;;
+    esac
+  done
+  require_repo
+  local f
+  f=$(scan_reports path "$sel") || exit 1
+  [ -f "$f" ] || die "report not found: $f"
+  if [ "$term" = 1 ]; then
+    [ -n "$GPTR_GLOW" ] || die "glow not found (brew install glow)"
+    local end; end=$(awk 'NR>1 && /^---[[:space:]]*$/{print NR; exit}' "$f")
+    err "research: ---- $f (glow) ----"
+    if [ -n "$end" ]; then
+      tail -n +"$((end + 1))" "$f" | "$GPTR_GLOW" -
+    else
+      "$GPTR_GLOW" "$f"
+    fi
+    return 0
+  fi
+  local out_html="${TMPDIR:-/tmp}/research-view-$(basename "${f%.md}").html"
+  GPTR_MD="$f" GPTR_HTML="$out_html" "$REPO/.venv/bin/python" - <<'PY'
+import datetime, os, markdown
+src, dst = os.environ["GPTR_MD"], os.environ["GPTR_HTML"]
+with open(src, encoding="utf-8") as fh:
+    text = fh.read()
+title = os.path.basename(src)[:-3]
+meta = {}
+if text.startswith("---"):
+    lines = text.splitlines()
+    for i, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            for h in lines[1:i]:
+                if ":" in h:
+                    k, v = h.split(":", 1)
+                    meta[k.strip()] = v.strip().strip('"')
+            for h in lines[1:i]:
+                if h.startswith("title:"):
+                    title = h.split(":", 1)[1].strip().strip('"')
+                    break
+            text = "\n".join(lines[i + 1:])
+            break
+body = markdown.markdown(text, extensions=["fenced_code", "tables", "sane_lists"])
+CSS = """
+body{font-family:-apple-system,system-ui,'Segoe UI',sans-serif;max-width:860px;margin:40px auto;padding:0 24px;line-height:1.65;color:#1a1a2e;background:#fdfdfd}
+h1{border-bottom:2px solid #e8e8ee;padding-bottom:8px}
+h2{border-bottom:1px solid #eee;padding-bottom:5px;margin-top:2em}
+code{background:#f2f2f6;padding:2px 5px;border-radius:4px;font-size:.9em}
+pre{background:#f2f2f6;padding:14px;border-radius:8px;overflow-x:auto}
+pre code{background:none;padding:0}
+blockquote{border-left:4px solid #d5d5e2;margin:0;padding:2px 16px;color:#555}
+table{border-collapse:collapse}
+th,td{border:1px solid #ddd;padding:6px 12px}
+th{background:#f2f2f6}
+a{color:#0a66d0}
+img{max-width:100%}
+.meta{color:#888;font-size:.85em;margin-bottom:24px}
+"""
+bits = [datetime.datetime.fromtimestamp(os.path.getmtime(src)).strftime("%Y-%m-%d %H:%M")]
+if meta.get("sources_count"):
+    bits.append(meta["sources_count"] + " sources")
+if meta.get("total_cost_usd"):
+    bits.append("$" + meta["total_cost_usd"])
+html = ('<!doctype html><html><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<title>' + title + '</title><style>' + CSS + '</style></head><body>'
+        '<div class="meta">' + " | ".join(bits) + " | " + src + '</div>'
+        + body + '</body></html>')
+with open(dst, "w", encoding="utf-8") as fh:
+    fh.write(html)
+print("rendered:", dst)
+PY
+  [ $? -eq 0 ] || die "failed to render $f to HTML"
+  err "research: opening in browser — $out_html"
+  open "$out_html"
+  printf '{"path":"%s","html":"%s"}\n' "$(json_escape "$f")" "$(json_escape "$out_html")"
+}
+
+port_up() { curl -s -o /dev/null --max-time 3 "$API_URL" ; }
+
+cmd_serve() {
+  local action="${1:-status}"
+  case "$action" in
+    start)
+      require_repo
+      if [ -f "$API_PID" ] && kill -0 "$(cat "$API_PID")" 2>/dev/null; then
+        err "research: server already running (pid $(cat "$API_PID"))"
+      else
+        err "research: starting run_api.sh in background (log: $API_LOG)"
+        ( cd "$REPO" && nohup ./run_api.sh >"$API_LOG" 2>&1 & echo $! >"$API_PID" )
+        sleep 1
+      fi
+      local i=0
+      while [ $i -lt 60 ]; do
+        if port_up; then err "research: server ready on $API_URL"; exit 0; fi
+        sleep 2; i=$((i + 1))
+      done
+      die "server did not become ready in 120s (log: $API_LOG)"
+      ;;
+    stop)
+      if [ -f "$API_PID" ]; then
+        local pid; pid=$(cat "$API_PID")
+        if kill -0 "$pid" 2>/dev/null; then
+          kill "$pid" 2>/dev/null; pkill -P "$pid" 2>/dev/null; sleep 2
+          kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+          err "research: server stopped (pid $pid)"
+        else
+          err "research: stale pidfile, pid $pid not running"
+        fi
+        rm -f "$API_PID"
+      else
+        err "research: no pidfile ($API_PID) — server not started by research"
+      fi
+      ;;
+    status)
+      if [ -f "$API_PID" ] && kill -0 "$(cat "$API_PID")" 2>/dev/null; then
+        if port_up; then err "research: running (pid $(cat "$API_PID")), $API_URL responding"
+        else err "research: process alive (pid $(cat "$API_PID")) but $API_URL not responding yet"; fi
+      else
+        err "research: not running"
+      fi
+      ;;
+    *) die "serve: use start|stop|status" ;;
+  esac
+}
+
+main() {
+  [ $# -ge 1 ] || { usage; exit 1; }
+  # Research-first (BALA rename directive 2026-11-07): the first argument is
+  # the QUERY unless it is a secondary subcommand.
+  case "$1" in
+    deep)  shift; cmd_deep "$@" ;;
+    multi) shift; cmd_multi "$@" ;;
+    list)  shift; cmd_list "$@" ;;
+    resolve) shift; cmd_resolve "$@" ;;
+    view)  shift; cmd_view "$@" ;;
+    serve) shift; cmd_serve "$@" ;;
+    help|-h|--help) usage; exit 0 ;;
+    *)     cmd_research "$@" ;;
+  esac
+}
+
+main "$@"
