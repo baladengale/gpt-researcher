@@ -1,0 +1,62 @@
+# GPT Researcher fullstack (UI + API behind in-container nginx on 3000).
+# Config comes from the `gpt-researcher` secret (envFrom): OPENAI_API_KEY /
+# OPENAI_BASE_URL / FAST_LLM / SMART_LLM / STRATEGIC_LLM / RETRIEVER / etc.
+# The secret is created by kind/scripts/91-research.sh from the repo's .env.
+#
+# Plain YAML — no variables: kubectl apply -f cluster/deploy/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpt-researcher
+  namespace: research
+  labels:
+    app: gpt-researcher
+    app.kubernetes.io/managed-by: kind-infra
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gpt-researcher
+  template:
+    metadata:
+      labels:
+        app: gpt-researcher
+    spec:
+      containers:
+      - name: gpt-researcher
+        # Pushed by cluster/push-image.sh to the internal registry; nodes pull
+        # from it via the containerd certs.d wiring (kind/scripts/50-registry.sh).
+        image: kind-registry.internal/gpt-researcher:local
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 3000
+        envFrom:
+        - secretRef:
+            name: gpt-researcher
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+        startupProbe:
+          tcpSocket:
+            port: 3000
+          periodSeconds: 5
+          failureThreshold: 36
+        readinessProbe:
+          tcpSocket:
+            port: 3000
+          periodSeconds: 10
+        livenessProbe:
+          tcpSocket:
+            port: 3000
+          periodSeconds: 20
+          failureThreshold: 6
+        volumeMounts:
+        - name: outputs
+          mountPath: /usr/src/app/outputs
+      volumes:
+      - name: outputs
+        emptyDir: {}

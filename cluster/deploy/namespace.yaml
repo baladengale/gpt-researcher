@@ -1,0 +1,7 @@
+# Plain YAML — no variables: kubectl apply -f cluster/deploy/namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: research
+  labels:
+    app.kubernetes.io/managed-by: kind-infra

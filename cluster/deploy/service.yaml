@@ -1,0 +1,16 @@
+# Plain YAML — no variables: kubectl apply -f cluster/deploy/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: gpt-researcher
+  namespace: research
+  labels:
+    app: gpt-researcher
+    app.kubernetes.io/managed-by: kind-infra
+spec:
+  selector:
+    app: gpt-researcher
+  ports:
+  - name: http
+    port: 3000
+    targetPort: 3000
