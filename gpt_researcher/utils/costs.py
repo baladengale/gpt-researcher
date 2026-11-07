@@ -29,6 +29,12 @@ logger = logging.getLogger(__name__)
 # specific patterns (e.g. "-mini") must come before their base model.
 # Prices as of July 2026: https://openai.com/api/pricing/
 OPENAI_MODEL_PRICING = (
+    # Z.AI GLM models (used here via the OpenAI-compatible provider); official
+    # rates: https://docs.z.ai/guides/overview/pricing (checked 2026-11-07).
+    # NOTE: Z.AI bills cached input at $0.03/MTok (0.2x input), but the generic
+    # cache path below applies OPENAI_CACHED_INPUT_DISCOUNT (0.5x) — a slight
+    # overestimate when responses report cache details.
+    (("glm-5.3-flash",), 0.15, 0.50),
     (("gpt-5.5-pro",), 30.0, 180.0),
     (("gpt-5.5",), 5.0, 30.0),
     (("gpt-5.4-pro",), 30.0, 180.0),
