@@ -277,7 +277,7 @@ async def test_provider_timeout_error_is_not_replaced(monkeypatch, stream):
 
 def test_timeout_configuration_default_and_explicit_precedence(monkeypatch):
     monkeypatch.delenv("LLM_TIMEOUT", raising=False)
-    assert GenericLLMProvider(object()).llm_timeout == 300
+    assert GenericLLMProvider(object()).llm_timeout == 60
     monkeypatch.setenv("LLM_TIMEOUT", "12.5")
     assert GenericLLMProvider(object()).llm_timeout == 12.5
     assert GenericLLMProvider(object(), llm_timeout=2).llm_timeout == 2

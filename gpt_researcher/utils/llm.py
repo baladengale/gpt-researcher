@@ -117,7 +117,7 @@ async def create_chat_completion(
     provider = get_llm(llm_provider, **provider_kwargs)
     response = ""
     # create response
-    max_attempts = 1 if (stream and websocket is not None) else 10
+    max_attempts = 1 if (stream and websocket is not None) else 5
     last_exception: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -129,6 +129,13 @@ async def create_chat_completion(
             logging.getLogger(__name__).warning(
                 f"LLM request failed (attempt {attempt}/{max_attempts}): {exc}"
             )
+            status_code = getattr(exc, "status_code", None)
+            if (
+                isinstance(status_code, int)
+                and 400 <= status_code < 500
+                and status_code not in (408, 409, 425, 429)
+            ):
+                break
             if attempt < max_attempts:
                 await asyncio.sleep(min(2 ** (attempt - 1), 8))
                 continue

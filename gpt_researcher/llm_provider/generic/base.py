@@ -121,7 +121,7 @@ class GenericLLMProvider:
         self.llm = llm
         self.chat_logger = ChatLogger(chat_log) if chat_log else None
         self.verbose = verbose
-        timeout = os.getenv("LLM_TIMEOUT", "300") if llm_timeout is None else llm_timeout
+        timeout = os.getenv("LLM_TIMEOUT", "60") if llm_timeout is None else llm_timeout
         timeout_error = (
             "LLM_TIMEOUT / llm_timeout must be a finite, non-negative number "
             "of seconds (0 disables it)"

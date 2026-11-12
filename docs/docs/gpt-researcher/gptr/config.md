@@ -138,7 +138,7 @@ The hard upper bound is 200k (sanity guard against typos).
 ## LLM Timeouts
 
 `LLM_TIMEOUT` sets the maximum time in seconds that the common LLM provider
-wrapper waits for a response. It defaults to `300` and accepts finite,
+wrapper waits for a response. It defaults to `60` and accepts finite,
 non-negative numbers. Set it in your environment or `.env` file:
 
 ```bash
@@ -169,9 +169,9 @@ through `create_chat_completion`; it does not set a deadline for an entire
 research task or for code that invokes a LangChain chain directly.
 
 A stalled call raises `TimeoutError` with the configured wait duration. The
-existing `create_chat_completion` retry policy logs failed attempts and remains
-unchanged: up to ten attempts for ordinary calls, and one attempt for streaming
-calls with a WebSocket. Higher-level callers may have their own fallback logic,
+`create_chat_completion` retry policy logs failed attempts and allows up to five
+attempts for ordinary calls, and one attempt for streaming calls with a WebSocket.
+Higher-level callers may have their own fallback logic,
 so the total research time can exceed a single timeout.
 
 ## Deep Research Configuration
